@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logburr.jpg" alt="logburr" width="720">
+</p>
+
 # Logburr
 
 Logs go brrr. Logburr sits in front of the pile and lets you read it.
@@ -119,6 +123,7 @@ Do not commit the logs or `responses/`. Those are the engagement. `.gitignore` a
 
 ```text
 logburr.py         the server and the page
+logburr.jpg        the logo
 requirements.txt   empty
 README.md
 .gitignore
