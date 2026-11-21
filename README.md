@@ -10,6 +10,11 @@ Point it at a directory of directory-fuzz output. It serves a filterable table o
 
 The page is one Python file. There is no build step. Python packages are not required. The file window uses GTK from the system.
 
+## Preview
+
+<img width="2560" height="1260" alt="logbrr-screenshot" src="https://github.com/user-attachments/assets/5ad7a2ad-558b-4636-971f-95f7d72e986e" />
+
+
 ## Install
 
 Python 3.10 or newer. `requirements.txt` names the system packages. `pip install -r requirements.txt` succeeds and installs nothing.
