@@ -16,13 +16,16 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
+import select
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,6 +44,41 @@ DIRSEARCH_HIT = re.compile(
     r"^(\d{3})\s+([\d.]+)\s*([KMGkmg]?B)\s+(\S+)(?:\s+->\s+(\S+))?\s*$"
 )
 SKIP_SUFFIXES = {".py", ".pyc", ".pyo"}
+SKIP_ASSET_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".pdf"}
+SKIP_NAMES = {
+    "readme",
+    "readme.md",
+    "readme.rst",
+    "readme.txt",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "license",
+    "license.md",
+    "license.txt",
+    "licence",
+    "licence.md",
+    "copying",
+    "copying.md",
+    "changelog",
+    "changelog.md",
+    "contributing.md",
+    "code_of_conduct.md",
+    "pyproject.toml",
+    "setup.cfg",
+    "package.json",
+    "cargo.toml",
+    "go.mod",
+    "makefile",
+    "dockerfile",
+}
+
+
+def skipped_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name.startswith(".") or name in SKIP_NAMES:
+        return True
+    suffix = path.suffix.lower()
+    return suffix in SKIP_SUFFIXES or suffix in SKIP_ASSET_SUFFIXES
 
 
 def clean(text: str) -> str:
@@ -552,16 +590,12 @@ def parse_log(name: str, text: str) -> dict:
 
 def log_paths(root: Path) -> list[Path]:
     if root.is_file():
-        if root.name.startswith(".") or root.suffix.lower() in SKIP_SUFFIXES:
-            return []
-        return [root]
+        return [] if skipped_file(root) else [root]
     if not root.is_dir():
         return []
     found = []
     for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        if path.suffix.lower() in SKIP_SUFFIXES:
+        if not path.is_file() or skipped_file(path):
             continue
         found.append(path)
     return found
@@ -624,14 +658,103 @@ def check_import(raw: str, home: Path) -> tuple[Path | None, str]:
         return None, "That folder is already the one Logburr opened."
     if path.is_file() and path.parent == home:
         return None, "That file is already in the open folder."
-    if path.is_file() and (path.name.startswith(".") or path.suffix.lower() in SKIP_SUFFIXES):
+    if path.is_file() and skipped_file(path):
         return None, "Logburr skips that file."
     if not path.is_file() and not path.is_dir():
         return None, "That path is not a file or a folder."
     return path, ""
 
 
-def add_import(home: Path, extras: list[Path], lock: threading.Lock, raw: str) -> dict:
+def _portal_object_path(text: str) -> str:
+    start = text.find("'/")
+    if start < 0:
+        return ""
+    end = text.find("'", start + 1)
+    if end < 0:
+        return ""
+    return text[start + 1:end]
+
+
+def _file_uris(text: str) -> list[str]:
+    paths = []
+    for uri in re.findall(r"file://[^\s'<>]+", text):
+        parsed = urllib.parse.urlparse(uri)
+        path = urllib.parse.unquote(parsed.path)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def choose_paths() -> dict:
+    gdbus = shutil.which("gdbus")
+    if not gdbus or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return {"ok": False, "message": "Paste a path. The file chooser needs a desktop session."}
+    stdbuf = shutil.which("stdbuf")
+    try:
+        opened = subprocess.run(
+            [
+                gdbus, "call", "--session",
+                "--dest", "org.freedesktop.portal.Desktop",
+                "--object-path", "/org/freedesktop/portal/desktop",
+                "--method", "org.freedesktop.portal.FileChooser.OpenFile",
+                "", "Import into Logburr",
+                "{'multiple': <true>, 'modal': <true>}",
+            ],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "message": "The file chooser did not open."}
+    if opened.returncode != 0:
+        detail = (opened.stderr or opened.stdout or "").strip()
+        return {"ok": False, "message": detail or "The file chooser did not open. Paste a path instead."}
+    handle = _portal_object_path(opened.stdout)
+    if not handle:
+        return {"ok": False, "message": "The file chooser did not open. Paste a path instead."}
+    command = [gdbus, "monitor", "--session", "--dest", "org.freedesktop.portal.Desktop", "--object-path", handle]
+    if stdbuf:
+        command = [stdbuf, "-oL", *command]
+    watcher = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    chunks: list[bytes] = []
+    assert watcher.stdout is not None
+    pipe = watcher.stdout.fileno()
+    os.set_blocking(pipe, False)
+    deadline = time.monotonic() + 300
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([pipe], [], [], 0.4)
+            if ready:
+                try:
+                    piece = os.read(pipe, 65536)
+                except OSError:
+                    break
+                if not piece:
+                    break
+                chunks.append(piece)
+                if b"Request.Response" in piece or b"Request.Response" in b"".join(chunks):
+                    break
+            elif watcher.poll() is not None:
+                break
+    finally:
+        watcher.kill()
+        watcher.wait(timeout=2)
+    text = b"".join(chunks).decode("utf-8", "replace")
+    if "Request.Response" not in text:
+        subprocess.run(
+            [gdbus, "call", "--session", "--dest", "org.freedesktop.portal.Desktop",
+             "--object-path", handle, "--method", "org.freedesktop.portal.Request.Close"],
+            capture_output=True, timeout=5,
+        )
+        return {"ok": False, "message": "The file chooser closed without a choice."}
+    code = re.search(r"uint32\s+(\d+)", text)
+    if code and code.group(1) != "0":
+        return {"ok": False, "message": "Import cancelled."}
+    paths = _file_uris(text)
+    if not paths:
+        return {"ok": False, "message": "Nothing selected."}
+    return {"ok": True, "paths": paths}
+
+
+def _add_one(home: Path, extras: list[Path], lock: threading.Lock, raw: str) -> dict:
     path, message = check_import(raw, home)
     if path is None:
         return {"ok": False, "message": message}
@@ -641,6 +764,32 @@ def add_import(home: Path, extras: list[Path], lock: threading.Lock, raw: str) -
         extras.append(path)
     kind = "file" if path.is_file() else "folder"
     return {"ok": True, "message": f"Imported {kind} {path}", "path": str(path)}
+
+
+def add_import(home: Path, extras: list[Path], lock: threading.Lock, raw: str) -> dict:
+    texts = [(raw or "").strip()]
+    if texts == [""]:
+        chosen = choose_paths()
+        if not chosen.get("ok"):
+            return chosen
+        texts = list(chosen.get("paths") or [])
+    added: list[str] = []
+    messages: list[str] = []
+    for text in texts:
+        result = _add_one(home, extras, lock, text)
+        messages.append(result["message"])
+        if result.get("ok"):
+            added.append(result["path"])
+    if not added:
+        return {"ok": False, "message": messages[-1] if messages else "Nothing imported."}
+    if len(texts) == 1:
+        return {"ok": True, "message": messages[0], "path": added[0], "paths": added}
+    return {
+        "ok": True,
+        "message": f"Imported {len(added)} files.",
+        "path": added[0],
+        "paths": added,
+    }
 
 
 def remove_import(extras: list[Path], lock: threading.Lock, raw: str) -> dict:
@@ -902,8 +1051,8 @@ PAGE = r"""<!DOCTYPE html>
   <aside>
     <h2>LOGS</h2>
     <form id="import-form" class="import">
-      <input id="import-path" type="text" spellcheck="false" autocomplete="off" placeholder="File or folder path">
-      <button type="submit">Import</button>
+      <input id="import-path" type="text" spellcheck="false" autocomplete="off" placeholder="Folder path, or leave empty" title="Leave this empty and press Import to open the file chooser. A typed path can be a file or a folder.">
+      <button type="submit" title="Import the path, or open the file chooser when the box is empty">Import</button>
     </form>
     <div id="import-list"></div>
     <div id="files"></div>
@@ -1912,28 +2061,36 @@ $("reload").addEventListener("click", () => {
   load(file && (file.source || file.name)).catch(() => toast("Refresh failed"));
 });
 async function importPath(path) {
-  const response = await fetch("/api/import", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path })
-  });
-  const data = await response.json();
-  toast(data.message || (data.ok ? "Imported" : "Could not import"));
-  if (!data.ok) return;
-  $("import-path").value = "";
-  const current = activeFile();
-  await load(current && current.source);
-  const matches = state.scan.files
-    .map((file, index) => ({ file, index }))
-    .filter((item) => item.file.source === data.path || item.file.imported === data.path);
-  if (!matches.length) return;
-  matches.sort((a, b) => b.file.rows.length - a.file.rows.length);
-  state.active = matches[0].index;
-  state.only = null;
-  state.prefix = null;
-  state.cursor = 0;
-  state.openKey = "";
-  render();
+  const button = $("import-form").querySelector("button");
+  button.disabled = true;
+  if (!path) toast("Opening the file chooser…");
+  try {
+    const response = await fetch("/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path })
+    });
+    const data = await response.json();
+    toast(data.message || (data.ok ? "Imported" : "Could not import"));
+    if (!data.ok) return;
+    $("import-path").value = "";
+    const current = activeFile();
+    await load(current && current.source);
+    const wanted = new Set(data.paths || (data.path ? [data.path] : []));
+    const matches = state.scan.files
+      .map((file, index) => ({ file, index }))
+      .filter((item) => wanted.has(item.file.source) || wanted.has(item.file.imported));
+    if (!matches.length) return;
+    matches.sort((a, b) => b.file.rows.length - a.file.rows.length);
+    state.active = matches[0].index;
+    state.only = null;
+    state.prefix = null;
+    state.cursor = 0;
+    state.openKey = "";
+    render();
+  } finally {
+    button.disabled = false;
+  }
 }
 async function removeImport(path) {
   const current = activeFile();
@@ -1949,7 +2106,6 @@ async function removeImport(path) {
 $("import-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const path = $("import-path").value.trim();
-  if (!path) { toast("Type a file or folder path"); return; }
   importPath(path).catch(() => toast("Could not reach the viewer"));
 });
 $("reset").addEventListener("click", () => {
