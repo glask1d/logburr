@@ -8,19 +8,26 @@ Logs go brrr. Logburr sits in front of the pile and lets you read it.
 
 Point it at a directory of directory-fuzz output. It serves a filterable table on localhost: status, size, words, payload, and the curl for that one row. Repeated responses collapse into buckets. One row can be copied, edited, sent through Burp, or run directly when Burp is not up. The response comes back in the page, highlighted, and you can save it next to the log that produced it.
 
-The page is one Python file. There is no build step and no third-party package.
+The page is one Python file. There is no build step. Python packages are not required. The file window uses GTK from the system.
 
 ## Install
 
-Python 3.10 or newer. [curl](https://curl.se/) on `PATH` if you want the Run button. Nothing to install from PyPI.
+Python 3.10 or newer. `requirements.txt` names the system packages. `pip install -r requirements.txt` succeeds and installs nothing.
+
+[curl](https://curl.se/) has to be on `PATH` for the Run button.
+
+The Import file window needs GTK 3 and PyGObject. On Debian, Ubuntu, and Pop!_OS those packages are `python3-gi` and `gir1.2-gtk-3.0`. Logburr opens the window with `/usr/bin/python3`, so a virtualenv that cannot see the system `gi` module still works. With no display, paste a path into the box.
 
 ```bash
+# Pop!_OS, Ubuntu, Debian
+sudo apt install curl python3-gi gir1.2-gtk-3.0
+
 git clone https://github.com/glask1d/logburr.git
 cd logburr
 python3 logburr.py ~/scans/api
 ```
 
-Open http://127.0.0.1:8877. `requirements.txt` is empty on purpose. `pip install -r requirements.txt` succeeds and installs nothing.
+Open http://127.0.0.1:8877.
 
 ```bash
 python3 logburr.py ~/scans/api --check   # parse and print a summary, then exit
@@ -29,7 +36,7 @@ python3 logburr.py ~/scans/api -p 9000   # another port
 
 The directory argument defaults to the folder that contains `logburr.py`. Pass the folder where the logs actually are. Refresh in the page rescans that folder, so a new report shows up without a restart. Dotfiles are skipped, and so are `.py` files, images, and project files such as `README.md`, `requirements.txt`, and `LICENSE`. Subdirectories are not scanned. Each file is read up to 20 MB.
 
-The sidebar has an import box. Press Import with the box empty and a file window opens in front. You can select more than one file. A path typed in the box can be a file or a folder, which is how a whole directory is added. Logburr reads it in place and leaves the file where it is. A folder import follows the same skip rules as the folder you started in. Refresh picks up new files in an imported folder. The × next to a path drops that import. Saved responses still go in `responses/` under the folder Logburr was started in.
+The sidebar has an import box. Press Import with the box empty and a GTK file window opens in front. You can select more than one file. Cancel closes the window and leaves the list alone. A path typed in the box can be a file or a folder, which is how a whole directory is added. Logburr reads it in place and leaves the file where it is. A folder import follows the same skip rules as the folder you started in. Refresh picks up new files in an imported folder. The × next to a path drops that import. Saved responses still go in `responses/` under the folder Logburr was started in. If the window cannot open, the page says so and a pasted path still works.
 
 ```bash
 python3 logburr.py ~/scans/api -i ~/scans/vhosts/gobuster.log
@@ -124,8 +131,9 @@ Do not commit the logs or `responses/`. Those are the engagement. `.gitignore` a
 ```text
 logburr.py         the server and the page
 logburr.jpg        the logo
-requirements.txt   empty
+requirements.txt   system packages; pip installs nothing
 README.md
+LICENSE
 .gitignore
 ```
 

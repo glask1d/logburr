@@ -1,5 +1,14 @@
-# Logburr uses only the Python standard library.
+# Logburr's viewer is the Python standard library.
 # `pip install -r requirements.txt` installs nothing.
 #
-# Run also needs the curl binary on PATH. That is a system package,
-# not a Python dependency.
+# These are system packages. Install them with the distro.
+#
+# curl
+#   The Run button calls this binary. It has to be on PATH.
+#
+# GTK 3 and PyGObject
+#   Pressing Import with an empty box opens a file window through these.
+#   On Debian, Ubuntu, and Pop!_OS the packages are python3-gi and
+#   gir1.2-gtk-3.0. Logburr starts that window with /usr/bin/python3,
+#   so a virtualenv that cannot import gi still gets the chooser.
+#   With no display, paste a path into the Import box.
