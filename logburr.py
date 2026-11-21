@@ -18,14 +18,12 @@ import html
 import json
 import os
 import re
-import select
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -665,90 +663,49 @@ def check_import(raw: str, home: Path) -> tuple[Path | None, str]:
     return path, ""
 
 
-def _portal_object_path(text: str) -> str:
-    start = text.find("'/")
-    if start < 0:
-        return ""
-    end = text.find("'", start + 1)
-    if end < 0:
-        return ""
-    return text[start + 1:end]
-
-
-def _file_uris(text: str) -> list[str]:
-    paths = []
-    for uri in re.findall(r"file://[^\s'<>]+", text):
-        parsed = urllib.parse.urlparse(uri)
-        path = urllib.parse.unquote(parsed.path)
-        if path:
-            paths.append(path)
-    return paths
+PICKER_SCRIPT = """
+import sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+Gtk.init(None)
+dialog = Gtk.FileChooserDialog(title="Import into Logburr", action=Gtk.FileChooserAction.OPEN)
+dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+dialog.add_button("Import", Gtk.ResponseType.ACCEPT)
+dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+dialog.set_select_multiple(True)
+dialog.set_keep_above(True)
+response = dialog.run()
+if response != Gtk.ResponseType.ACCEPT:
+    sys.exit(1)
+for path in dialog.get_filenames():
+    print(path)
+"""
 
 
 def choose_paths() -> dict:
-    gdbus = shutil.which("gdbus")
-    if not gdbus or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
-        return {"ok": False, "message": "Paste a path. The file chooser needs a desktop session."}
-    stdbuf = shutil.which("stdbuf")
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        return {"ok": False, "message": "Paste a path. No display is available for the file chooser."}
+    python = "/usr/bin/python3"
+    if not Path(python).is_file():
+        return {"ok": False, "message": "Paste a path. The file chooser is unavailable."}
     try:
-        opened = subprocess.run(
-            [
-                gdbus, "call", "--session",
-                "--dest", "org.freedesktop.portal.Desktop",
-                "--object-path", "/org/freedesktop/portal/desktop",
-                "--method", "org.freedesktop.portal.FileChooser.OpenFile",
-                "", "Import into Logburr",
-                "{'multiple': <true>, 'modal': <true>}",
-            ],
-            capture_output=True, text=True, timeout=20, check=False,
+        completed = subprocess.run(
+            [python, "-"],
+            input=PICKER_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "message": "The file chooser did not open."}
-    if opened.returncode != 0:
-        detail = (opened.stderr or opened.stdout or "").strip()
-        return {"ok": False, "message": detail or "The file chooser did not open. Paste a path instead."}
-    handle = _portal_object_path(opened.stdout)
-    if not handle:
-        return {"ok": False, "message": "The file chooser did not open. Paste a path instead."}
-    command = [gdbus, "monitor", "--session", "--dest", "org.freedesktop.portal.Desktop", "--object-path", handle]
-    if stdbuf:
-        command = [stdbuf, "-oL", *command]
-    watcher = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    chunks: list[bytes] = []
-    assert watcher.stdout is not None
-    pipe = watcher.stdout.fileno()
-    os.set_blocking(pipe, False)
-    deadline = time.monotonic() + 300
-    try:
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([pipe], [], [], 0.4)
-            if ready:
-                try:
-                    piece = os.read(pipe, 65536)
-                except OSError:
-                    break
-                if not piece:
-                    break
-                chunks.append(piece)
-                if b"Request.Response" in piece or b"Request.Response" in b"".join(chunks):
-                    break
-            elif watcher.poll() is not None:
-                break
-    finally:
-        watcher.kill()
-        watcher.wait(timeout=2)
-    text = b"".join(chunks).decode("utf-8", "replace")
-    if "Request.Response" not in text:
-        subprocess.run(
-            [gdbus, "call", "--session", "--dest", "org.freedesktop.portal.Desktop",
-             "--object-path", handle, "--method", "org.freedesktop.portal.Request.Close"],
-            capture_output=True, timeout=5,
-        )
-        return {"ok": False, "message": "The file chooser closed without a choice."}
-    code = re.search(r"uint32\s+(\d+)", text)
-    if code and code.group(1) != "0":
+        return {"ok": False, "message": "The file chooser timed out."}
+    if completed.returncode == 1:
         return {"ok": False, "message": "Import cancelled."}
-    paths = _file_uris(text)
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        return {"ok": False, "message": detail[-1] if detail else "The file chooser did not open. Paste a path instead."}
+    paths = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
     if not paths:
         return {"ok": False, "message": "Nothing selected."}
     return {"ok": True, "paths": paths}

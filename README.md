@@ -29,7 +29,7 @@ python3 logburr.py ~/scans/api -p 9000   # another port
 
 The directory argument defaults to the folder that contains `logburr.py`. Pass the folder where the logs actually are. Refresh in the page rescans that folder, so a new report shows up without a restart. Dotfiles are skipped, and so are `.py` files, images, and project files such as `README.md`, `requirements.txt`, and `LICENSE`. Subdirectories are not scanned. Each file is read up to 20 MB.
 
-The sidebar has an import box. Press Import with the box empty and the desktop file chooser opens. You can select more than one file. A path typed in the box can be a file or a folder, which is how a whole directory is added. Logburr reads it in place and leaves the file where it is. A folder import follows the same skip rules as the folder you started in. Refresh picks up new files in an imported folder. The × next to a path drops that import. Saved responses still go in `responses/` under the folder Logburr was started in.
+The sidebar has an import box. Press Import with the box empty and a file window opens in front. You can select more than one file. A path typed in the box can be a file or a folder, which is how a whole directory is added. Logburr reads it in place and leaves the file where it is. A folder import follows the same skip rules as the folder you started in. Refresh picks up new files in an imported folder. The × next to a path drops that import. Saved responses still go in `responses/` under the folder Logburr was started in.
 
 ```bash
 python3 logburr.py ~/scans/api -i ~/scans/vhosts/gobuster.log
