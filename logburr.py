@@ -6,6 +6,7 @@ and serves a filterable table on localhost. Nothing leaves the machine
 until you press Run or Send to Burp.
 
     python3 logburr.py ~/scans/api
+    python3 logburr.py ~/scans/api -i ~/scans/other/ffuf.md
     python3 logburr.py ~/scans/api -p 8877
     python3 logburr.py ~/scans/api --check
 """
@@ -549,19 +550,110 @@ def parse_log(name: str, text: str) -> dict:
     return with_curl(parse_generic(name, text))
 
 
-def scan(directory: Path) -> dict:
-    files = []
-    for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+def log_paths(root: Path) -> list[Path]:
+    if root.is_file():
+        if root.name.startswith(".") or root.suffix.lower() in SKIP_SUFFIXES:
+            return []
+        return [root]
+    if not root.is_dir():
+        return []
+    found = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
         if not path.is_file() or path.name.startswith("."):
             continue
         if path.suffix.lower() in SKIP_SUFFIXES:
             continue
+        found.append(path)
+    return found
+
+
+def read_one(path: Path) -> dict:
+    resolved = path.resolve()
+    try:
         data = path.read_bytes()[:20_000_000]
         text = data.decode("utf-8", "replace")
         parsed = parse_log(path.name, text)
         parsed["size"] = path.stat().st_size
-        files.append(parsed)
-    return {"dir": str(directory), "files": files}
+    except OSError as exc:
+        parsed = empty_file(path.name, "empty", {}, [], f"Could not read this file. {exc}")
+        parsed["size"] = 0
+    parsed["source"] = str(resolved)
+    return parsed
+
+
+def scan(directory: Path, extras: list[Path] | None = None) -> dict:
+    files = []
+    seen: set[Path] = set()
+    groups: list[tuple[Path, str]] = [(directory, "")]
+    for extra in extras or []:
+        groups.append((extra, str(extra)))
+    for root, imported in groups:
+        for path in log_paths(root):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            parsed = read_one(path)
+            parsed["imported"] = imported
+            files.append(parsed)
+    names: dict[str, int] = {}
+    for item in files:
+        names[item["name"]] = names.get(item["name"], 0) + 1
+    for item in files:
+        if names[item["name"]] > 1:
+            item["label"] = f"{Path(item['source']).parent.name}/{item['name']}"
+        else:
+            item["label"] = item["name"]
+    return {
+        "dir": str(directory),
+        "imports": [str(extra) for extra in (extras or [])],
+        "files": files,
+    }
+
+
+def check_import(raw: str, home: Path) -> tuple[Path | None, str]:
+    text = (raw or "").strip()
+    if not text:
+        return None, "Type a file or folder path."
+    path = Path(text).expanduser()
+    if not path.exists():
+        return None, f"Nothing at {path}"
+    path = path.resolve()
+    home = home.resolve()
+    if path == home:
+        return None, "That folder is already the one Logburr opened."
+    if path.is_file() and path.parent == home:
+        return None, "That file is already in the open folder."
+    if path.is_file() and (path.name.startswith(".") or path.suffix.lower() in SKIP_SUFFIXES):
+        return None, "Logburr skips that file."
+    if not path.is_file() and not path.is_dir():
+        return None, "That path is not a file or a folder."
+    return path, ""
+
+
+def add_import(home: Path, extras: list[Path], lock: threading.Lock, raw: str) -> dict:
+    path, message = check_import(raw, home)
+    if path is None:
+        return {"ok": False, "message": message}
+    with lock:
+        if any(item == path for item in extras):
+            return {"ok": False, "message": "That path is already imported."}
+        extras.append(path)
+    kind = "file" if path.is_file() else "folder"
+    return {"ok": True, "message": f"Imported {kind} {path}", "path": str(path)}
+
+
+def remove_import(extras: list[Path], lock: threading.Lock, raw: str) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        return {"ok": False, "message": "Missing a path."}
+    path = Path(text).expanduser().resolve()
+    with lock:
+        kept = [item for item in extras if item != path]
+        if len(kept) == len(extras):
+            return {"ok": False, "message": "That path is not imported."}
+        extras[:] = kept
+    return {"ok": True, "message": f"Removed {path}", "path": str(path)}
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -635,8 +727,25 @@ PAGE = r"""<!DOCTYPE html>
   .file.on { background: var(--bg-3); border-left-color: var(--green); }
   .file .nm { grid-column: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file .ct { grid-column: 2; color: var(--green); }
-  .file .sub { grid-column: 1 / -1; color: var(--faint); font-size: 11px; }
+  .file .sub {
+    grid-column: 1 / -1; color: var(--faint); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .file .ct.zero { color: var(--faint); }
+  .import { display: flex; gap: 6px; padding: 0 12px 8px; }
+  .import input { flex: 1; min-width: 0; width: auto; }
+  .import button { flex: none; padding: 6px 8px; }
+  .import-chip {
+    display: flex; align-items: center; gap: 6px;
+    margin: 0 12px 6px; color: var(--muted); font-size: 11px;
+  }
+  .import-chip span {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .import-chip button {
+    flex: none; border: 0; background: transparent; color: var(--faint);
+    cursor: pointer; font: inherit; padding: 0 2px;
+  }
   main { display: flex; flex-direction: column; min-width: 0; }
   #meta { padding: 12px 16px 0; color: var(--muted); }
   #meta .target { color: var(--ink); }
@@ -792,6 +901,11 @@ PAGE = r"""<!DOCTYPE html>
 <div class="app">
   <aside>
     <h2>LOGS</h2>
+    <form id="import-form" class="import">
+      <input id="import-path" type="text" spellcheck="false" autocomplete="off" placeholder="File or folder path">
+      <button type="submit">Import</button>
+    </form>
+    <div id="import-list"></div>
     <div id="files"></div>
   </aside>
   <main>
@@ -1002,7 +1116,7 @@ function renderFiles() {
   if (!list.length) {
     const p = document.createElement("p");
     p.className = "empty";
-    p.textContent = "No log files in this directory.";
+    p.textContent = "No logs yet. Import a file or folder above.";
     filesEl.appendChild(p);
     return;
   }
@@ -1012,13 +1126,18 @@ function renderFiles() {
     button.className = "file" + (index === state.active ? " on" : "");
     const name = document.createElement("span");
     name.className = "nm";
-    name.textContent = file.name;
+    name.textContent = file.label || file.name;
+    name.title = file.source || file.name;
     const count = document.createElement("span");
     count.className = "ct" + (file.rows.length ? "" : " zero");
     count.textContent = file.rows.length ? String(file.rows.length) : "0";
     const sub = document.createElement("span");
     sub.className = "sub";
-    sub.textContent = file.tool + (file.meta && file.meta.target ? "  ·  " + file.meta.target : "");
+    const bits = [];
+    if (file.imported) bits.push(file.source);
+    bits.push(file.tool + (file.meta && file.meta.target ? "  ·  " + file.meta.target : ""));
+    sub.textContent = bits.filter(Boolean).join("  ·  ");
+    sub.title = sub.textContent;
     button.append(name, count, sub);
     button.addEventListener("click", () => {
       state.active = index;
@@ -1397,9 +1516,28 @@ function renderTable(model) {
   if (state.keyboard && selectedRow) selectedRow.scrollIntoView({ block: "nearest" });
 }
 
+function renderImports() {
+  const box = $("import-list");
+  box.textContent = "";
+  (state.scan.imports || []).forEach((path) => {
+    const row = document.createElement("div");
+    row.className = "import-chip";
+    const span = document.createElement("span");
+    span.textContent = path;
+    span.title = path;
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.textContent = "×";
+    drop.title = "Remove this import";
+    drop.addEventListener("click", () => removeImport(path));
+    row.append(span, drop);
+    box.appendChild(row);
+  });
+}
 function render() {
   if (!state.scan) return;
   $("where").textContent = state.scan.dir;
+  renderImports();
   renderFiles();
   const model = viewModel();
   if (!model) {
@@ -1407,7 +1545,7 @@ function render() {
     scroller.textContent = "";
     const p = document.createElement("p");
     p.className = "empty";
-    p.textContent = "Drop feroxbuster, ffuf, or gobuster logs in this directory and refresh.";
+    p.textContent = "Import a log file or a folder, or drop logs in the folder Logburr opened.";
     scroller.appendChild(p);
     return;
   }
@@ -1419,12 +1557,12 @@ function render() {
   if ($("edit-request").checked) loadEditor(false);
 }
 
-async function load(keepName) {
+async function load(keepSource) {
   const response = await fetch("/api/scan", { cache: "no-store" });
   if (!response.ok) throw new Error("scan failed");
   state.scan = await response.json();
-  if (keepName) {
-    const index = state.scan.files.findIndex((file) => file.name === keepName);
+  if (keepSource) {
+    const index = state.scan.files.findIndex((file) => file.source === keepSource || file.name === keepSource);
     if (index >= 0) state.active = index;
   } else if (state.scan.files.length) {
     let best = 0;
@@ -1771,7 +1909,48 @@ $("output-save").addEventListener("click", async () => {
 });
 $("reload").addEventListener("click", () => {
   const file = activeFile();
-  load(file && file.name).catch(() => toast("Refresh failed"));
+  load(file && (file.source || file.name)).catch(() => toast("Refresh failed"));
+});
+async function importPath(path) {
+  const response = await fetch("/api/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path })
+  });
+  const data = await response.json();
+  toast(data.message || (data.ok ? "Imported" : "Could not import"));
+  if (!data.ok) return;
+  $("import-path").value = "";
+  const current = activeFile();
+  await load(current && current.source);
+  const matches = state.scan.files
+    .map((file, index) => ({ file, index }))
+    .filter((item) => item.file.source === data.path || item.file.imported === data.path);
+  if (!matches.length) return;
+  matches.sort((a, b) => b.file.rows.length - a.file.rows.length);
+  state.active = matches[0].index;
+  state.only = null;
+  state.prefix = null;
+  state.cursor = 0;
+  state.openKey = "";
+  render();
+}
+async function removeImport(path) {
+  const current = activeFile();
+  const response = await fetch("/api/unimport", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path })
+  });
+  const data = await response.json();
+  toast(data.message || (data.ok ? "Removed" : "Could not remove"));
+  if (data.ok) await load(current && current.source);
+}
+$("import-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const path = $("import-path").value.trim();
+  if (!path) { toast("Type a file or folder path"); return; }
+  importPath(path).catch(() => toast("Could not reach the viewer"));
 });
 $("reset").addEventListener("click", () => {
   state.q = "";
@@ -1871,7 +2050,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", body)
             return
         if parsed.path == "/api/scan":
-            body = json.dumps(scan(self.directory)).encode("utf-8")
+            with self.extra_lock:
+                extras = list(self.extra_paths)
+            body = json.dumps(scan(self.directory, extras)).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
             return
         self._send(404, "text/plain; charset=utf-8", b"not found\n")
@@ -1879,7 +2060,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
-        if route not in {"/api/burp", "/api/run", "/api/save"}:
+        if route not in {"/api/burp", "/api/run", "/api/save", "/api/import", "/api/unimport"}:
             self._send(404, "text/plain; charset=utf-8", b"not found\n")
             return
         limit = 2_200_000 if route == "/api/save" else 262144
@@ -1903,6 +2084,14 @@ class Handler(BaseHTTPRequestHandler):
             headers = []
         if route == "/api/save":
             result = save_response(self.directory, str(incoming.get("name") or ""), str(incoming.get("text") or ""))
+            self._reply(result, 200 if result.get("ok") else 400)
+            return
+        if route == "/api/import":
+            result = add_import(self.directory, self.extra_paths, self.extra_lock, str(incoming.get("path") or ""))
+            self._reply(result, 200 if result.get("ok") else 400)
+            return
+        if route == "/api/unimport":
+            result = remove_import(self.extra_paths, self.extra_lock, str(incoming.get("path") or ""))
             self._reply(result, 200 if result.get("ok") else 400)
             return
         method = str(incoming.get("method") or "GET")
@@ -1932,12 +2121,18 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s  %s\n" % (self.log_date_time_string(), fmt % args))
 
 
-def serve(directory: Path, host: str, port: int) -> None:
-    handler = type("BoundHandler", (Handler,), {"directory": directory})
+def serve(directory: Path, host: str, port: int, extras: list[Path] | None = None) -> None:
+    handler = type(
+        "BoundHandler",
+        (Handler,),
+        {"directory": directory, "extra_paths": list(extras or []), "extra_lock": threading.Lock()},
+    )
     server = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{port}"
     print("logburr")
     print(f"  logs  {directory}")
+    for extra in extras or []:
+        print(f"  also  {extra}")
     print(f"  open  {url}")
     print(f"  burp  {BURP_PROXY}")
     print("  run   direct curl, proxy skipped")
@@ -1955,21 +2150,30 @@ def main() -> None:
     parser.add_argument("directory", nargs="?", default=str(Path(__file__).resolve().parent), help="Directory of log files. Defaults to this script's folder.")
     parser.add_argument("-p", "--port", type=int, default=8877)
     parser.add_argument("-b", "--bind", default="127.0.0.1", help="Address to bind. Defaults to localhost.")
+    parser.add_argument("-i", "--import", dest="imports", action="append", default=[], metavar="PATH", help="Also read this log file or directory. Repeat for more than one.")
     parser.add_argument("--check", action="store_true", help="Parse the logs, print a summary, and exit.")
     args = parser.parse_args()
     directory = Path(args.directory).expanduser().resolve()
     if not directory.is_dir():
         sys.exit(f"not a directory: {directory}")
+    extras: list[Path] = []
+    for raw in args.imports:
+        path, message = check_import(raw, directory)
+        if path is None:
+            sys.exit(message)
+        if path not in extras:
+            extras.append(path)
     if args.check:
-        report = scan(directory)
+        report = scan(directory, extras)
         if not report["files"]:
             print(f"no log files in {directory}")
             return
         for item in report["files"]:
             target = item["meta"].get("target") or item["note"]
-            print(f"{item['tool']:<12} {item['name']:<24} {len(item['rows']):4} hits  {target}")
+            where = f"  [{item['imported']}]" if item.get("imported") else ""
+            print(f"{item['tool']:<12} {item['label']:<28} {len(item['rows']):4} hits  {target}{where}")
         return
-    serve(directory, args.bind, args.port)
+    serve(directory, args.bind, args.port, extras)
 
 
 if __name__ == "__main__":
